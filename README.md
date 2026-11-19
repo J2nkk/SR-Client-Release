@@ -1,15 +1,18 @@
-# SR Client
+# SR Client Dev
 
-A native Krunker client for competitive and custom lobbies. The game runs as a
-real desktop program (Odin + Vulkan), not inside a browser.
+**This is the `dev` branch: the developer build for testers.** It has the
+newest changes before they reach a normal release, plus testing tools (see
+[Dev build](#dev-build)). For everyday play use the normal client on the
+[`main`](../../tree/main) branch.
 
-## Download & play
-1. Go to **Releases** and download `SR-Client-Setup-x.y.z.exe`.
-2. Run it. SR Client installs for your user (no admin) and starts.
+## Download & play (Dev)
+1. Download **`SR-Client-Dev-x.y.z.zip`** from the
+   [SR Client Dev pre-release](../../releases/tag/dev-latest) (always the newest
+   dev build; replaced on every push to this branch).
+2. Unzip it anywhere (no installer) and run **`sr_client_dev.exe`**.
 3. Press **Login**, sign in to Krunker, paste a lobby invite and press **Join**.
-
-Prefer no installer? Download `SR-Client-Portable-x.y.z.zip`, unzip anywhere,
-run `sr_client.exe`.
+4. Found a problem? Use the tester export (one button; saves your settings,
+   version and logs to Downloads) and send the zip.
 
 **Best experience: play in Fullscreen or Borderless** (Settings > Display >
 Video mode). Both send frames straight to the screen (~0.15 ms from a

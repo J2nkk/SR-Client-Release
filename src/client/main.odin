@@ -1377,7 +1377,7 @@ client_tick :: proc(client: ^Client, now, delta: f32) {
 		}
 	}
 
-	editing_settings := client.menu.page == .SETTINGS || client.menu.page == .CONTROLS || client.menu.page == .HOST
+	editing_settings := client.menu.page == .SETTINGS || client.menu.page == .CONTROLS || client.menu.page == .HOST || menuui.login_typing(&client.menu)
 	debug_key := !editing_settings && glfw.GetKey(client.window, glfw.KEY_GRAVE_ACCENT) == glfw.PRESS
 	freecam_key := glfw.GetKey(client.window, glfw.KEY_RIGHT_BRACKET) == glfw.PRESS
 

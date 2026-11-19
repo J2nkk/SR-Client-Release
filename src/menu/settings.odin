@@ -43,7 +43,14 @@ settings_window :: proc(state: ^State, view: View) {
 					text("*", 20, s, SETTINGS_RESTART_RED)
 					text("= needs a restart", 16, s, SETTINGS_MUTED)
 				}
-				if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, padding = clay.PaddingAll(u16(24*s))}}) { text("SR CLIENT", 16, s, SETTINGS_MUTED) }
+				// The window has a fixed height: with the crosshair preview there is no
+				// room for this label, and the sidebar grew past the window's bottom
+				// border and pushed the footer (Cancel, Save) out of it.
+				if state.settings_tab == .VIDEO {
+					if clay.UI()({layout = {sizing = {height = clay.SizingFixed(24*s)}}}) {}
+				} else {
+					if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, padding = clay.PaddingAll(u16(24*s))}}) { text("SR CLIENT", 16, s, SETTINGS_MUTED) }
+				}
 			}
 			if clay.UI(clay.ID("SettingsContent"))({layout = {sizing = {width = clay.SizingGrow(), height = clay.SizingGrow()}, layoutDirection = .TopToBottom}}) {
 				if clay.UI(clay.ID("SettingsHeading"))({layout = {sizing = {width = clay.SizingGrow(), height = clay.SizingFixed(80*s)}, padding = {left = u16(32*s), right = u16(32*s)}, childAlignment = {y = .Center}}, backgroundColor = SETTINGS_DARK}) {

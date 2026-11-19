@@ -74,6 +74,11 @@ Krunker_WS_State :: struct {
 	snapshots_received: int,
 	server_error: string,
 	auth_rejected: bool,
+	// The account login on this connection (_0 "login"), sent once after ready.
+	account_login_sent: bool,
+	// Krunker sent the account ("a", no error) on this connection: a game can
+	// be hosted from it (custom) without a new lobby or verification.
+	account_loaded: bool,
 }
 
 krunker_ws_set_status :: proc(client: ^Client, text: string) {
@@ -330,6 +335,50 @@ krunker_ws_finish_packet :: proc(payload: [dynamic]byte, opcode: string, ah_num:
 	return out
 }
 
+// Krunker's page logs an account in on an open lobby connection with
+// ["_0", 0, "login", <FRVR access token>] (a request; the reply is
+// ["_0", 0, true], after the account itself, "a"). The token in the socket
+// address is no longer enough for that (seen live 2026-11-19: no "a", and
+// custom games answered "Invalid User"). Captured from the page by
+// login_watch.js during a browser login.
+// With the bare account token in at=, Krunker sends the account ("a") by
+// itself, as for the logged-in page; the page then sends no _0. SR sends it
+// only as a fallback when no account arrived (host_game.odin).
+KRUNKER_ACCOUNT_LOGIN_ID :: 0
+
+krunker_ws_account_login_payload :: proc(token: string) -> [dynamic]byte {
+	out: [dynamic]byte
+	krunker_ws_pack_array(&out, 4)
+	krunker_ws_pack_string(&out, "_0")
+	krunker_ws_pack_int(&out, KRUNKER_ACCOUNT_LOGIN_ID)
+	krunker_ws_pack_string(&out, "login")
+	krunker_ws_pack_string(&out, token)
+	return out
+}
+
+// Once per connection, after ready, with SR's account access token.
+krunker_ws_send_account_login :: proc(client: ^Client) -> bool {
+	state := &client.krunker
+	if state.account_login_sent || !state.connected || state.handle == nil { return false }
+	token := client.access.token
+	if accessui.token_state(token, time.time_to_unix(time.now())) != .READY { return false }
+	state.account_login_sent = true
+	krunker_net_send_begin()
+	defer krunker_net_send_end()
+	next_counter := state.ah_num
+	packet := krunker_ws_finish_packet(krunker_ws_account_login_payload(token), "_0", &next_counter)
+	defer delete(packet)
+	sent: c.size_t
+	code := krunker_ws_raw_send(state, packet[:], &sent)
+	if code != .E_OK || int(sent) != len(packet) {
+		kproto.network_log("account", fmt.tprintf("ERROR account login send failed curl=%v sent=%d expected=%d", code, sent, len(packet)))
+		return false
+	}
+	state.ah_num = next_counter
+	kproto.network_log("account", fmt.tprintf("sent account login (_0 login, token omitted) bytes=%d counter=%d", len(packet), state.ah_num))
+	return true
+}
+
 krunker_ws_message :: proc(opcode: string, ah_num: ^u8, q_index: int, team: i32 = 0, class_index: i32 = 0, secondary_index: i32 = 2) -> [dynamic]byte {
 	message: [dynamic]byte
 	switch opcode {
@@ -504,6 +553,7 @@ krunker_ws_apply_world :: proc(client: ^Client, payload: []byte, send_control: p
 				kproto.network_log("msgpack-args", len(text) > 700 ? text[:700] : text)
 			}
 		}
+		host_game_log_recv(packet)
 		client.krunker_world.received_at = received_at >= 0 ? received_at : glfw.GetTime()
 		applied := kproto.krunker_world_apply_packet(&client.krunker_world, packet)
 		if is_text {
@@ -554,7 +604,16 @@ krunker_ws_apply_world :: proc(client: ^Client, payload: []byte, send_control: p
 			case "cust":
 				host_game_on_custom(client, packet)
 			case "a":
+				account_error := len(packet) > 1 ? packet[1].(string) or_else "" : ""
+				if len(account_error) == 0 { state.account_loaded = true }
 				host_game_on_account(client, packet)
+			case "_0":
+				// Reply to a request: [id, ok]. Id 0 is the account login.
+				id := len(packet) > 1 ? kproto.krunker_world_i32(packet[1], -1) : -1
+				ok := len(packet) > 2 && kproto.krunker_world_bool(packet[2])
+				if id == KRUNKER_ACCOUNT_LOGIN_ID {
+					kproto.network_log("account", ok ? "Krunker accepted the account login on this connection (_0 login: true)" : fmt.tprintf("ERROR Krunker refused the account login on this connection (_0 login answered %v)", packet[2:] if len(packet) > 2 else packet[1:]))
+				}
 			case "start":
 				kproto.network_log("spawn", fmt.tprintf("server start received; local_sid=%d players=%d; waiting for renderer handoff", client.krunker_world.local_sid, len(client.krunker_world.players)))
 				state.input_sequence = max(state.input_sequence, 13)
@@ -775,8 +834,13 @@ krunker_ws_connect :: proc(client: ^Client, link: ^shared.Join_Link) -> bool {
 	when ODIN_OS == .Windows {
 		if client.access.status == .PENDING { return true }
 		client.access.captcha_retried = false
-		if client_access_browser_link(link) && !client_access_select(client, time.time_to_unix(time.now())) {
-			return client_access_begin(client)
+		// Access without a browser: memory or cache, else the stored FRVR session
+		// (renewed through FRVR's API). Without a session, SR asks for a login
+		// in its Account window; the browser only opens for verification.
+		now := time.time_to_unix(time.now())
+		if client_access_browser_link(link) && !client_access_select(client, now) && !client_access_renew(client, now) {
+			client_access_need_login(client)
+			return false
 		}
 	}
 	return krunker_ws_connect_ready(client, link)

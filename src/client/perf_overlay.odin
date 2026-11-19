@@ -266,7 +266,7 @@ perf_overlay_set :: proc(client: ^Client, enabled: bool) {
 // The toggle works in gameplay and menus, except while a key bind is being
 // captured or a menu text field has the keyboard. Returns true on a toggle.
 client_perf_overlay_toggle_update :: proc(client: ^Client, read: proc(glfw.WindowHandle, i32) -> bool = client_binding_down) -> bool {
-	typing := client.menu.binding_capture != 0 || client.menu.number_edit != .NONE || client.menu.color_edit != 0 || client.menu.import_open || menuui.settings_search_focused(&client.menu) || menuui.host_typing(&client.menu)
+	typing := client.menu.binding_capture != 0 || client.menu.number_edit != .NONE || client.menu.color_edit != 0 || client.menu.import_open || menuui.settings_search_focused(&client.menu) || menuui.host_typing(&client.menu) || menuui.login_typing(&client.menu)
 	// Track the raw key so a key still held after capturing it as a new bind
 	// does not toggle the window when the capture ends.
 	down := client_action_down(client, .DEBUG_OVERLAY, read)

@@ -30,6 +30,12 @@ Browser :: struct {
 	waiting_for_login: bool,
 	captcha: bool,
 	captcha_game: string,
+	// SR Client's FRVR session for the verification page (written to its
+	// localStorage before the page's scripts run, so its SDK never renews it).
+	session_access, session_refresh: string,
+	login_requests_sent: int, // login_watch.js lines already sent to SR Client
+	ready_since: time.Time,   // first READY answer, while the recorder finishes
+	login_rpc_seen: time.Time, // the page's lobby account login (_0 login) was recorded
 	// SR Client: Krunker's Mods window; copies the zip of the mod the player
 	// loads into SR Client's mods folder (mod_file) and reports it.
 	mods: bool,
@@ -49,11 +55,16 @@ install_vtable: [4]rawptr
 
 notify :: proc(kind, value: string) {
 	if browser.probe {
-		fmt.println(kind == "TOKEN" ? "TOKEN_REDACTED" : kind == "TRACE" ? access.diagnostic_text(value) : access.status_text(value))
+		fmt.println(kind == "TOKEN" || kind == "SESSION_REFRESH" ? "TOKEN_REDACTED" : kind == "TRACE" ? access.diagnostic_text(value) : access.status_text(value))
 		return
 	}
 	if !access.send(browser.output, access.Message{browser.id, kind, value}) { browser.done = true }
 }
+login_dump_enabled :: proc() -> bool {
+	value, found := os.lookup_env_alloc("SR_LOGIN_DUMP", context.temp_allocator)
+	return found && value == "1"
+}
+
 // Only state transitions cross IPC; the half-second polling loop stays quiet.
 trace_script :: proc(code: string) -> bool {
 	text := access.diagnostic_text(code)
@@ -190,22 +201,40 @@ controller_ready :: proc "system" (this: rawptr, result: win.HRESULT, controller
 		if err != nil { fail("CAPTCHA_SETUP_FAILED"); return 0 }
 		defer delete(game_json)
 		script := fmt.tprintf("window.__srCaptchaGame = %s;\n%s", string(game_json), string(#load("captcha.js")))
+		if len(browser.session_access) > 0 && len(browser.session_refresh) > 0 {
+			access_json, access_err := json.marshal(browser.session_access, allocator = context.temp_allocator)
+			refresh_json, refresh_err := json.marshal(browser.session_refresh, allocator = context.temp_allocator)
+			if access_err == nil && refresh_err == nil {
+				// Concatenation, not fmt: the script's braces are not format braces.
+				// Stored JSON-encoded, the FRVR SDK's own format ("\"eyJ...\"").
+				script = strings.concatenate({`(() => { try { if (window === window.top && location.origin === 'https://krunker.io') { localStorage.setItem('__FRVR_auth_access_token', JSON.stringify(`, string(access_json), `)); localStorage.setItem('__FRVR_auth_refresh_token', JSON.stringify(`, string(refresh_json), `)); } } catch {} })();`, "\n", script}, context.temp_allocator)
+			}
+		}
 		if (cast(proc "system" (^COM, ^u16, ^Handler) -> win.HRESULT)browser.view.v[27])(browser.view, raw_data(win.utf8_to_utf16(script)), &install_handler) < 0 { fail("CAPTCHA_SETUP_FAILED") }
 	} else if browser.mods {
 		// add_WebMessageReceived: mods.js pushes the mod link here.
 		if (cast(proc "system" (^COM, ^Handler, ^i64) -> win.HRESULT)browser.view.v[34])(browser.view, &message_handler, &event) < 0 { mods_log("message channel could not be opened (polling only)") } else { mods_log("message channel open") }
 		if (cast(proc "system" (^COM, ^u16, ^Handler) -> win.HRESULT)browser.view.v[27])(browser.view, raw_data(win.utf8_to_utf16(string(#load("mods.js")))), &install_handler) < 0 { fail("HELPER_FAILED") }
 	} else {
-		if (cast(proc "system" (^COM, ^u16) -> win.HRESULT)browser.view.v[5])(browser.view, win.L("https://krunker.io/")) < 0 { fail("HELPER_FAILED") }
+		// Browser login: record how the page logs in (field names only), then
+		// open Krunker once the recorder is in place (handoff_installed).
+		if (cast(proc "system" (^COM, ^u16, ^Handler) -> win.HRESULT)browser.view.v[27])(browser.view, raw_data(win.utf8_to_utf16(string(#load("login_watch.js")))), &install_handler) < 0 {
+			if (cast(proc "system" (^COM, ^u16) -> win.HRESULT)browser.view.v[5])(browser.view, win.L("https://krunker.io/")) < 0 { fail("HELPER_FAILED") }
+		}
 	}
 	return 0
 }
 handoff_installed :: proc "system" (this: rawptr, result: win.HRESULT, data: ^u16) -> win.HRESULT {
 	context = runtime.default_context()
 	if browser.done { return 0 }
+	if result < 0 && !browser.captcha && !browser.mods {
+		// The login recorder is optional: open Krunker without it.
+		if (cast(proc "system" (^COM, ^u16) -> win.HRESULT)browser.view.v[5])(browser.view, win.L("https://krunker.io/")) < 0 { fail("HELPER_FAILED") }
+		return 0
+	}
 	if result < 0 { fail("CAPTCHA_SETUP_FAILED"); return 0 }
 	mods_log("watcher script installed, opening https://krunker.io/")
-	notify("TRACE", browser.mods ? "MODS_ARMED" : "CAPTCHA_ARMED")
+	notify("TRACE", browser.mods ? "MODS_ARMED" : browser.captcha ? "CAPTCHA_ARMED" : "LOGIN_WATCH_ARMED")
 	// An empty game is SR Client's Host: the verification is for the lobby
 	// the new custom game is created from.
 	url := browser.mods || len(browser.captcha_game) == 0 ? "https://krunker.io/" : fmt.tprintf("https://krunker.io/?game=%s", browser.captcha_game)
@@ -318,6 +347,30 @@ script_completed :: proc "system" (this: rawptr, result: win.HRESULT, data: ^u16
 		}
 		return 0
 	}
+	// Full login dump (complete requests/responses, password blanked): only to
+	// a local file, %LOCALAPPDATA%\SR-Client\login-dump.txt, never over IPC.
+	// Only with SR_LOGIN_DUMP=1 set: the file holds login tokens.
+	if entries, has_dump := object["dump"].(json.Array); has_dump && len(entries) > 0 && login_dump_enabled() {
+		if local, found := os.lookup_env_alloc("LOCALAPPDATA", context.temp_allocator); found && len(local) > 0 {
+			if file, err := os.open(fmt.tprintf("%s\\SR-Client\\login-dump.txt", local), {.Write, .Append, .Create}); err == nil {
+				for entry in entries {
+					if text, ok := entry.(json.String); ok { _, _ = os.write_string(file, string(text)); _, _ = os.write_string(file, "\r\n") }
+				}
+				os.close(file)
+			}
+		}
+	}
+	// New lines from the login recorder: request shapes, no values.
+	if requests, has_requests := object["requests"].(json.Array); has_requests {
+		for i := browser.login_requests_sent; i < len(requests) && i < 120; i += 1 {
+			line, is_text := requests[i].(json.String)
+			printable := is_text && len(line) > 0 && len(line) <= 600
+			if printable { for c in transmute([]u8)string(line) { if c < 32 || c > 126 { printable = false; break } } }
+			if printable { notify("LOGIN_REQUEST", string(line)) }
+			if printable && strings.has_prefix(string(line), "WS SEND lobby _0 ") && browser.login_rpc_seen == {} { browser.login_rpc_seen = time.now() }
+			browser.login_requests_sent = i + 1
+		}
+	}
 	browser.waiting_for_login = state == "WAIT_LOGIN" || state == "WAIT_TOKEN" || state == "WAIT_STORAGE" || state == "GUEST_TOKEN"
 	switch string(state) {
 	case "SDK_AVAILABLE": browser.sdk_seen = true; notify("STATUS", "SDK_AVAILABLE"); browser.done = true
@@ -325,7 +378,22 @@ script_completed :: proc "system" (this: rawptr, result: win.HRESULT, data: ^u16
 		browser.sdk_seen = true
 		token, valid := object["token"].(json.String)
 		if !valid || !access.usable(string(token), time.time_to_unix(time.now())) { fail("BAD_TOKEN"); return 0 }
+		// After a fresh login, give the login recorder 3 seconds to see what
+		// the page then sends on its lobby socket (login_watch.js).
+		// Wait until the page has logged its lobby connection in (_0 login) and
+		// the recorder relabelled it (2 s), or 20 s at most.
+		// (Diagnostics only, SR_LOGIN_DUMP=1: a normal login closes at once.)
+		if !browser.probe && browser.login_requests_sent > 0 && login_dump_enabled() {
+			if browser.ready_since == {} { browser.ready_since = time.now() }
+			waited := time.since(browser.ready_since)
+			if browser.login_rpc_seen == {} && waited < 20*time.Second { return 0 }
+			if browser.login_rpc_seen != {} && time.since(browser.login_rpc_seen) < 3*time.Second { return 0 }
+		}
 		_ = os.write_entire_file(browser.session_path, []byte{1})
+		// The page's refresh token goes first: SR renews the session itself.
+		if refresh, has_refresh := object["refresh"].(json.String); has_refresh && len(refresh) > 0 && len(refresh) <= 32768 {
+			notify("SESSION_REFRESH", string(refresh))
+		}
 		notify("TOKEN", string(token)); browser.done = true
 	case "SESSION_REJECTED":
 		browser.sdk_seen, browser.rejected = true, true
@@ -360,8 +428,19 @@ main :: proc() {
 		browser.captcha = request.kind == "CAPTCHA"
 		browser.mods = request.kind == "MODS"
 		if browser.captcha {
-			if len(request.value) > 0 && !access.captcha_game_valid(request.value) { fail("CAPTCHA_SETUP_FAILED"); return }
-			browser.captcha_game = request.value
+			// The game alone, or {game, access, refresh} with SR's FRVR session.
+			game := request.value
+			if strings.has_prefix(request.value, "{") {
+				Captcha_Request :: struct { game, access, refresh: string }
+				parsed: Captcha_Request
+				if json.unmarshal(transmute([]byte)request.value, &parsed, allocator = context.temp_allocator) != nil { fail("CAPTCHA_SETUP_FAILED"); return }
+				game = parsed.game
+				if len(parsed.access) <= 32768 && len(parsed.refresh) <= 32768 && access.token_state(parsed.access, time.time_to_unix(time.now())) == .READY {
+					browser.session_access, browser.session_refresh = strings.clone(parsed.access), strings.clone(parsed.refresh)
+				}
+			}
+			if len(game) > 0 && !access.captcha_game_valid(game) { fail("CAPTCHA_SETUP_FAILED"); return }
+			browser.captcha_game = strings.clone(game)
 		}
 	}
 	defer delete(request.kind); defer delete(request.value)
@@ -417,7 +496,10 @@ main :: proc() {
 	if browser.captcha { win.SetWindowTextW(browser.window, win.L("SR Client - Verification for native Join")) }
 	if browser.mods { win.SetWindowTextW(browser.window, win.L("SR Client - Krunker mods (press Load Mod)")) }
 	defer win.DestroyWindow(browser.window)
-	if first || request.kind != "REFRESH" || browser.probe { show() }
+	// Verification starts hidden: Krunker's check usually passes on its own in
+	// a few seconds. The window appears only if it needs the player (12 s, or
+	// when the page opens a popup).
+	if !browser.captcha && (first || request.kind != "REFRESH" || browser.probe) { show() }
 	if create_fn(nil, raw_data(win.utf8_to_utf16(profile)), nil, &env_handler) < 0 { fail("PROFILE_FAILED"); return }
 	defer {
 		if browser.controller != nil { (cast(proc "system" (^COM) -> win.HRESULT)browser.controller.v[24])(browser.controller) }
@@ -467,6 +549,9 @@ main :: proc() {
 		}
 		if browser.view != nil && !browser.executing && time.since(last_poll) > poll_wait && access.official_source(get_text(browser.view, 4)) {
 			script := fmt.tprintf("window.__srProbeOnly = %s;\n%s", browser.probe ? "true" : "false", string(#load("auth.js")))
+			// With the login recorder's lines (login_watch.js) added to the answer.
+			script = strings.concatenate({"(() => { const __srResult = ", strings.trim_right(strings.trim_space(script[strings.index(script, "\n")+1:]), ";"), "; try { if (__srResult && typeof __srResult === 'object') { __srResult.requests = (window.__srLoginWatch || []).slice(0, 120); const d = window.__srLoginDump || []; let i = window.__srDumpCursor || 0; const out = []; let size = 0; while (i < d.length && size + d[i].length < 30000) { out.push(d[i]); size += d[i].length; i++; } window.__srDumpCursor = i; __srResult.dump = out; } } catch {} return __srResult; })()"}, context.temp_allocator)
+			if browser.probe { script = fmt.tprintf("window.__srProbeOnly = true;\n%s", script) }
 			if browser.captcha { script = `(() => { const s = window.__srCaptchaHandoff; return s ? {state:s.state, token:s.token, assignment:s.assignment || ''} : {state:'WAIT_CAPTCHA'}; })()` }
 			// Built by concatenation, NOT fmt: Odin's fmt reads "{...}" as its own
 			// format braces and mangled this script into a syntax error, so every

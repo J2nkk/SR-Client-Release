@@ -3,6 +3,7 @@ package browser_access
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import win "core:sys/windows"
 
@@ -39,6 +40,33 @@ when ODIN_TEST {
 		testing.expect(t, forget(directory))
 		testing.expect(t, !os.is_dir(profile) && !os.is_file(fmt.tprintf("%s\\%s", directory, CACHE_NAME)))
 		testing.expect(t, !os.is_file(legacy), "Forget also removes the legacy token cache")
+	}
+	@(test)
+	dpapi_session_roundtrip_and_forget :: proc(t: ^testing.T) {
+		directory, err := os.make_directory_temp("", "sr-session-test-", context.allocator)
+		if !testing.expect(t, err == nil) { return }
+		defer { os.remove_all(directory); delete(directory) }
+		a, r, ok := session_load(directory)
+		testing.expect(t, !ok && len(a) == 0 && len(r) == 0, "no session file: no session")
+		testing.expect(t, !session_save("bad\nvalue", "refresh", directory), "tokens with line breaks are refused")
+		if !testing.expect(t, session_save("access.token.value", "refresh.token.value", directory)) { return }
+		encrypted, read_err := os.read_entire_file_from_path(fmt.tprintf("%s\\%s", directory, SESSION_NAME), context.allocator)
+		defer delete(encrypted)
+		testing.expect(t, read_err == nil && !strings.contains(string(encrypted), "refresh.token.value"), "the session file is encrypted")
+		a, r, ok = session_load(directory)
+		testing.expect(t, ok && a == "access.token.value" && r == "refresh.token.value")
+		delete(a); delete(r)
+		// Sessions and caches saved from the SDK's JSON-encoded storage ("\"eyJ...\"")
+		// load as the bare token (a quoted at= made Krunker treat SR as a guest).
+		testing.expect(t, session_save("\"access.token.value\"", "\"refresh.token.value\"", directory))
+		a, r, ok = session_load(directory)
+		testing.expect(t, ok && a == "access.token.value" && r == "refresh.token.value", "quoted session tokens load bare")
+		delete(a); delete(r)
+		testing.expect(t, cache_save("\"cached.token.value\"", directory))
+		cached := cache_load(directory); defer delete(cached)
+		testing.expect(t, cached == "cached.token.value", "a quoted access cache loads bare")
+		testing.expect(t, token_unquote("eyJ.a.b") == "eyJ.a.b" && token_unquote("\"eyJ.a.b\"") == "eyJ.a.b" && token_unquote("\"") == "\"")
+		testing.expect(t, forget(directory) && !os.is_file(fmt.tprintf("%s\\%s", directory, SESSION_NAME)), "Log out removes the session")
 	}
 	@(test)
 	private_pipe_drains_messages_after_helper_exit :: proc(t: ^testing.T) {

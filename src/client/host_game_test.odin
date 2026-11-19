@@ -1,9 +1,12 @@
 package main
 
 import "core:encoding/hex"
+import "core:strings"
 import "core:testing"
 import menuui "../menu"
 import kproto "../krunker"
+import shared "../shared"
+import curl "vendor:curl"
 
 // Krunker's own Comp setup with its defaults (Burg, 4v4), captured from its
 // page on 2026-11-16 without the 2-byte counter. SR Client must send exactly this.
@@ -153,4 +156,51 @@ host_region_is_krunkers_default_region :: proc(t: ^testing.T) {
 	hud.default_region = 8
 	testing.expect_value(t, menuui.default_region(hud).id, "us-tx")
 	testing.expect_value(t, menuui.default_region(hud).name, "Dallas")
+}
+
+// Hosting while already connected (e.g. in the last hosted game) reuses that
+// connection: no disconnect, no new lobby, so no matchmaker verification.
+@(test)
+host_game_reuses_the_current_connection :: proc(t: ^testing.T) {
+	saved := g_host
+	defer g_host = saved
+	g_host = {}
+	client: Client
+	defer { shared.join_link_free(&client.join_link); delete(client.join_status) }
+	link, ok := shared.join_link_parse("https://krunker.io/?game=NY:abcde")
+	if !testing.expect(t, ok) { return }
+	client.join_link = link
+	testing.expect(t, !host_game_can_reuse(&client), "not connected: a new lobby is needed")
+	client.krunker.connected, client.krunker.ready_received = true, true
+	client.krunker.handle = cast(^curl.CURL)rawptr(uintptr(1)) // never used: nothing is sent here
+	client.krunker.account_loaded = true
+	client.krunker.spawned = true
+	testing.expect(t, host_game_can_reuse(&client), "a loaded Krunker connection can host")
+	host_game_start_on_connection(&client)
+	testing.expect(t, g_host.phase == .WAITING && g_host.reused && g_host.account_ready, "custom goes out on this connection, with the account already loaded")
+	testing.expect(t, client.krunker.connected && !client.krunker.spawned && client.join_link.game_id == "NY:abcde", "the connection stays; the match state is cleared")
+	host_game_fail(&client, "Krunker: test")
+	testing.expect(t, client.krunker.connected && g_host.phase == .NONE, "a failed host on a reused connection keeps the player where they were")
+	client.krunker.handle = nil
+}
+
+@(test)
+krunker_account_login_message_matches_the_page :: proc(t: ^testing.T) {
+	// The page's message: ["_0", 0, "login", token] (login_watch.js capture).
+	token := strings.repeat("t", 300, context.temp_allocator)
+	payload := krunker_ws_account_login_payload(token)
+	defer delete(payload)
+	messages, _, error_text := kproto.krunker_msgpack_decode_packet(append_trailer(payload[:]))
+	if !testing.expect(t, len(error_text) == 0 && len(messages) == 1, "the login message must decode as one msgpack message") { return }
+	packet, ok := messages[0].([]kproto.Krunker_Msgpack_Value)
+	if !testing.expect(t, ok && len(packet) == 4) { return }
+	testing.expect(t, (packet[0].(string) or_else "") == "_0")
+	testing.expect(t, kproto.krunker_world_i32(packet[1], -1) == KRUNKER_ACCOUNT_LOGIN_ID)
+	testing.expect(t, (packet[2].(string) or_else "") == "login")
+	testing.expect(t, (packet[3].(string) or_else "") == token)
+}
+@(private = "file") append_trailer :: proc(payload: []byte) -> []byte {
+	out := make([]byte, len(payload) + 2, context.temp_allocator)
+	copy(out, payload)
+	return out
 }

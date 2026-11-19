@@ -4,6 +4,12 @@
     if (window.__srProbeOnly) {
         return {state: typeof window.FRVR?.auth?.getFreshAccessToken === 'function' ? 'SDK_AVAILABLE' : 'WAIT_SDK'};
     }
+    const unquote = value => {
+        if (typeof value === 'string' && value.length >= 2 && value[0] === '"') {
+            try { const parsed = JSON.parse(value); if (typeof parsed === 'string') return parsed; } catch {}
+        }
+        return value;
+    };
     let token;
     let gate;
     try {
@@ -21,7 +27,8 @@
             delete window.__srAccess;
         }
         if (Date.now() < gate.readyAt) return {state: 'WAIT_STORAGE'};
-        token = localStorage.getItem('__FRVR_auth_access_token');
+        // The SDK stores tokens JSON-encoded ("\"eyJ...\""): hand over the bare token.
+        token = unquote(localStorage.getItem('__FRVR_auth_access_token'));
     } catch {
         return {state: 'STORAGE_UNAVAILABLE'};
     }
@@ -47,7 +54,11 @@
                 }
                 const {exp} = claims;
                 if (Number.isSafeInteger(exp) && exp > Math.floor(Date.now() / 1000) + 60) {
-                    return {state: 'READY', token};
+                    // The refresh token too: SR Client renews the session through
+                    // FRVR's API from now on, without this browser.
+                    let refresh = '';
+                    try { refresh = unquote(localStorage.getItem('__FRVR_auth_refresh_token')) || ''; } catch {}
+                    return {state: 'READY', token, refresh};
                 }
             }
         } catch { /* Wait for the site to finish login or refresh; never forward malformed tokens. */ }

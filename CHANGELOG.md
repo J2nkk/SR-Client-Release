@@ -1,5 +1,24 @@
 # Changelog
 
+## SR Client 0.55.0
+- **Hosting works again:** Krunker's login service started storing login
+  tokens with quote marks, and SR sent them that way, so Krunker treated SR
+  as a guest ("Invalid User"). Tokens are now passed bare.
+- **Host from where you are:** Start Game while in a lobby or game (e.g. the
+  one you just hosted) creates the new game on that connection, like
+  Krunker's page: no new lobby, no verification.
+- **Login without a browser:** email + password, or a code sent by email,
+  straight to Krunker's login service. SR keeps the login (encrypted, never
+  the password) and renews it itself.
+- **Username / Google login** still opens Krunker's page once, because
+  Krunker verifies every username login with a CAPTCHA; SR keeps the login
+  afterwards.
+- **Verification:** Krunker asks for it on every new lobby, logged in or
+  not. SR now runs it hidden; the window only appears if Krunker wants a
+  puzzle solved (after 12 s).
+- **Menus:** the mouse wheel scrolls the host page while over a text field;
+  the settings window's Cancel/Save stay inside its border on the Display tab.
+
 ## SR Client 0.54.0
 - **Faster HUD:** the built HUD (timer, scores, leaderboard, player panel,
   weapons, ammo, chat, FPS) is kept and drawn again for up to 1 ms instead of

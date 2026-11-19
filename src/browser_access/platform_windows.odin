@@ -44,7 +44,9 @@ cache_load :: proc(directory: string = "") -> string {
 	defer delete(data)
 	plain, ok := protect(data, false)
 	if !ok { return "" }
-	return string(plain)
+	defer delete(plain)
+	// Caches saved before token_unquote hold the SDK's quoted form.
+	return strings.clone(token_unquote(string(plain)))
 }
 
 cache_save :: proc(token: string, directory: string = "") -> bool {
@@ -58,6 +60,46 @@ cache_save :: proc(token: string, directory: string = "") -> bool {
 	return os.write_entire_file(path, data) == nil
 }
 
+// The FRVR session SR renews itself (crucible.frvr.com/v1/auth/refresh): the
+// access and refresh tokens, DPAPI-encrypted, one per line.
+SESSION_NAME :: "session.dpapi"
+
+session_load :: proc(directory: string = "") -> (access_token, refresh_token: string, ok: bool) {
+	root := len(directory) > 0 ? strings.clone(directory) : root_path(); defer delete(root)
+	if len(root) == 0 { return }
+	data, err := os.read_entire_file_from_path(fmt.tprintf("%s\\%s", root, SESSION_NAME), context.allocator)
+	if err != nil { return }
+	defer delete(data)
+	plain, decrypted := protect(data, false)
+	if !decrypted { return }
+	defer delete(plain)
+	first, _, second := strings.partition(string(plain), "\n")
+	// Sessions saved before token_unquote hold the SDK's quoted form.
+	first, second = token_unquote(first), token_unquote(second)
+	if len(first) == 0 || len(second) == 0 { return }
+	return strings.clone(first), strings.clone(second), true
+}
+
+session_save :: proc(access_token, refresh_token: string, directory: string = "") -> bool {
+	if len(access_token) == 0 || len(refresh_token) == 0 || strings.contains_any(access_token, "\r\n") || strings.contains_any(refresh_token, "\r\n") { return false }
+	root := len(directory) > 0 ? strings.clone(directory) : root_path(); defer delete(root)
+	if len(root) == 0 { return false }
+	if os.make_directory(root) != nil && !os.is_dir(root) { return false }
+	plain := strings.concatenate({access_token, "\n", refresh_token}); defer delete(plain)
+	data, ok := protect(transmute([]byte)plain, true)
+	if !ok { return false }
+	defer delete(data)
+	return os.write_entire_file(fmt.tprintf("%s\\%s", root, SESSION_NAME), data) == nil
+}
+
+session_invalidate :: proc(directory: string = "") -> bool {
+	root := len(directory) > 0 ? strings.clone(directory) : root_path(); defer delete(root)
+	if len(root) == 0 { return false }
+	path := fmt.tprintf("%s\\%s", root, SESSION_NAME)
+	if !os.is_file(path) { return true }
+	return os.remove(path) == nil
+}
+
 cache_invalidate :: proc(directory: string = "") -> bool {
 	root := len(directory) > 0 ? strings.clone(directory) : root_path(); defer delete(root)
 	if len(root) == 0 { return false }
@@ -69,7 +111,7 @@ cache_invalidate :: proc(directory: string = "") -> bool {
 forget :: proc(directory: string = "") -> bool {
 	root := len(directory) > 0 ? strings.clone(directory) : root_path(); defer delete(root)
 	if len(root) == 0 { return false }
-	if !cache_invalidate(root) { return false }
+	if !cache_invalidate(root) || !session_invalidate(root) { return false }
 	legacy := fmt.tprintf("%s\\access.dpapi", root)
 	if os.is_file(legacy) && os.remove(legacy) != nil { return false }
 	profile := fmt.tprintf("%s\\Browser", root)

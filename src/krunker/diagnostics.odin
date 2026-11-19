@@ -126,7 +126,8 @@ network_log_mutex: sync.Mutex
 // errors and HTTP failures. Plain progress lines ("HTTP=200 ... No error",
 // "limit_exceeded=false") are not.
 network_log_is_problem :: proc(stage, message: string) -> bool {
-	if stage == "server-error" { return true }
+	// login-shape: how Krunker's page logs in (field names only), always kept.
+	if stage == "server-error" || stage == "login-shape" { return true }
 	if strings.has_prefix(message, "ERROR") || strings.has_prefix(message, "WARNING") { return true }
 	if strings.has_prefix(message, "HTTP=") {
 		// 101 (WebSocket upgrade), 2xx and 3xx are fine; 4xx, 5xx and "no reply" (0) are not.

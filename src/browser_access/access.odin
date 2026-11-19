@@ -83,6 +83,33 @@ token_state :: proc(token: string, now: i64) -> Token_State {
 
 usable :: proc(token: string, now: i64) -> bool { return token_state(token, now) == .READY }
 
+// FRVR's SDK stores its tokens in localStorage JSON-encoded ("\"eyJ...\"",
+// seen 2026-11-19). Krunker needs the bare token: a quoted one in the lobby
+// address (at=) is not read as an account, so the lobby treats SR as a guest
+// ("Invalid User" when hosting). A slice of token; the caller clones it.
+token_unquote :: proc(token: string) -> string {
+	value := strings.trim_space(token)
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' { return value[1:len(value)-1] }
+	return value
+}
+
+// The JWT's exp claim (unix seconds), 0 when it has none. Decoded only.
+token_expiry :: proc(token: string) -> i64 {
+	parts := strings.split(token, ".")
+	defer delete(parts)
+	if len(parts) != 3 { return 0 }
+	payload, err := base64.decode(parts[1], base64.DEC_URL_TABLE)
+	if err != nil { return 0 }
+	defer delete(payload)
+	value, parse_err := json.parse(payload, parse_integers = true)
+	if parse_err != .None { return 0 }
+	defer json.destroy_value(value)
+	object, ok := value.(json.Object)
+	if !ok { return 0 }
+	exp, valid := object["exp"].(json.Integer)
+	return valid ? i64(exp) : 0
+}
+
 // Deliberately narrow: permission, capacity, and generic 403 failures must not refresh.
 token_rejection_reason :: proc(reason: string) -> bool {
 	for code in ([]string{"TOKEN_EXPIRED", "INVALID_TOKEN", "ACCESS_TOKEN_EXPIRED", "INVALID_ACCESS_TOKEN", "Token expired", "Access token expired", "Invalid access token", "jwt expired", "invalid token"}) {
@@ -152,6 +179,7 @@ diagnostic_text :: proc(code: string) -> string {
 	case "STORAGE_UNAVAILABLE": return "Official page localStorage could not be read."
 	case "SCRIPT_FAILED": return "Browser authentication script failed; waiting for the page to initialize."
 	case "SCRIPT_INVALID_RESULT": return "Browser authentication script returned no recognized state; waiting for page initialization."
+	case "LOGIN_WATCH_ARMED": return "Browser login: recording how Krunker's page logs in (addresses and field names only, never values)."
 	case "CAPTCHA_ARMED": return "Socket handoff v2 installed before site scripts; assigned browser sockets will be captured before opening."
 	case "WAIT_CAPTCHA": return "Waiting for the official page to request and complete its challenge."
 	case "CAPTCHA_READY": return "Challenge proof captured before browser matchmaking could consume it; handing it to the native client."

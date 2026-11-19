@@ -74,6 +74,7 @@ Full details per version are in [`CHANGELOG.md`](CHANGELOG.md).
 
 | Version | Highlights |
 |---|---|
+| 0.55 | Hosting works again (bare login tokens); host from the lobby or game you are in without verification; email/password and email-code login without a browser; hidden verification; menu scroll and settings border fixes |
 | 0.54 | Faster HUD (half its CPU time); more FPS and less delay than 0.47 in Fullscreen and Windowed; mouse delay in the latency probe |
 | 0.47 | Fullscreen/Borderless recommendation under Video mode; the Experimental network thread answers Krunker's ping as soon as it arrives; X3D V-Cache core pinning; same or better FPS and delay than 0.46 in every display mode |
 | 0.46 | Hit registration timers in Krunker's exact milliseconds; class slides; Infiltrator knife charge and charge bar; scope settings; Krunker's kill cam; Burg's cart wheels; inputs-per-second choices 120-1000; red * on settings that need a restart |

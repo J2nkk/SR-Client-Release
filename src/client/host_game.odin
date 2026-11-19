@@ -40,6 +40,11 @@ HOST_ACCOUNT_WAIT :: 8 * time.Second
 // Shown instead of a stale "Creating your custom game..." when the lobby
 // connection closes before the game exists ("failed" also keeps it in the log).
 HOST_LOST_CONNECTION :: "Hosting failed: the connection to Krunker closed before the game was created. Press Host game to try again."
+// Krunker answered "Invalid User" and never sent the account on this connection.
+HOST_NOT_LOGGED_IN :: "Hosting failed: Krunker's game server did not log your account in (Invalid User), so it treats you as a guest. Check that hosting works on krunker.io, then log in again and retry."
+// While hosting, every packet Krunker sends that is not routine game traffic
+// is logged by opcode, so a failed host shows what Krunker did and did not send.
+HOST_RECV_LOG_LIMIT :: 64
 
 HOST_IMAGE_DIR :: "img/maps/"
 HOST_BANNER_FILE :: "img/maps/comp_banner.png"
@@ -59,6 +64,26 @@ Host_Game :: struct {
 	// Krunker's page sends "custom" only once the socket has logged the
 	// account in (ACCOUNT_RESPONSE "a"); sending earlier is "Invalid User".
 	account_ready: bool,
+	recv_logged: int, // packets logged for this game (HOST_RECV_LOG_LIMIT)
+	// Hosting from the Krunker connection SR already has (a lobby or game,
+	// e.g. the last hosted one): custom moves it into the new game, as on
+	// Krunker's page. No new lobby, so no matchmaker verification.
+	reused: bool,
+}
+
+// Connected to a Krunker lobby or game that has loaded (ready).
+host_game_can_reuse :: proc(client: ^Client) -> bool {
+	state := &client.krunker
+	return state.connected && state.handle != nil && state.ready_received && client_access_browser_link(&client.join_link)
+}
+
+// Every packet while a game is being created: opcode and argument count only
+// (account packets can carry personal data).
+host_game_log_recv :: proc(packet: []kproto.Krunker_Msgpack_Value) {
+	if g_host.phase != .SEEKING && g_host.phase != .WAITING && g_host.phase != .CREATING { return }
+	if g_host.recv_logged >= HOST_RECV_LOG_LIMIT || krunker_ws_routine_packet(packet[0]) { return }
+	g_host.recv_logged += 1
+	kproto.network_log("host-recv", fmt.tprintf("opcode=%v args=%d phase=%v", packet[0], len(packet) - 1, g_host.phase))
 }
 g_host: Host_Game
 
@@ -248,6 +273,8 @@ host_game_start :: proc(client: ^Client) {
 	settings := &client.menu.host
 	host_settings_save(settings)
 	client.menu.page, client.menu.focus = .HOME, client.menu.return_focus
+	if host_game_can_reuse(client) { host_game_start_on_connection(client); return }
+	g_host.reused = false
 	client_leave_session(client, false)
 	shared.join_link_free(&client.join_link)
 	link, ok := shared.join_link_parse("https://krunker.io/")
@@ -258,10 +285,28 @@ host_game_start :: proc(client: ^Client) {
 	krunker_ws_set_status(client, fmt.tprintf("Creating your custom game (%s)...", host_region(client).name))
 }
 
+// Start Game while connected to a Krunker lobby or game: send custom on that
+// connection (host_game_tick), as Krunker's page does.
+host_game_start_on_connection :: proc(client: ^Client) {
+	// Same connection: the match the player is in ends for them here.
+	kproto.network_log("host", fmt.tprintf("creating a custom game on the current connection (game %s); no new lobby, no verification", client.join_link.game_id))
+	state := &client.krunker
+	state.spawned, state.bootstrapped, state.bootstrap_step = false, false, 0
+	client.spawn_pending, client.has_life = false, false
+	client_clear_players(client)
+	kill_feed_clear(&client.kill_feed)
+	death_cam_end()
+	g_host.reused, g_host.tries, g_host.recv_logged = true, 0, 0
+	g_host.account_ready = state.account_loaded
+	g_host.phase, g_host.since = .WAITING, time.now()
+	krunker_ws_set_status(client, "Creating your custom game on your current connection...")
+}
+
 host_game_fail :: proc(client: ^Client, reason: string) {
 	kproto.network_log("host", fmt.tprintf("hosting stopped: %s", reason))
 	g_host.phase = .NONE
-	client_leave_session(client, false)
+	// A reused connection stays where it was (unless it is already gone).
+	if !g_host.reused || !client.krunker.connected { client_leave_session(client, false) }
 	krunker_ws_set_status(client, reason)
 }
 
@@ -294,7 +339,16 @@ host_game_on_custom :: proc(client: ^Client, packet: []kproto.Krunker_Msgpack_Va
 	text := len(packet) > 1 ? packet[1].(string) or_else "" : ""
 	game := len(packet) > 2 ? packet[2].(string) or_else "" : ""
 	if len(game) > 0 || len(text) == 0 { return }
-	kproto.network_log("host", fmt.tprintf("Krunker answered custom (try %d): %s", g_host.tries, text))
+	kproto.network_log("host", fmt.tprintf("Krunker answered custom (try %d): %s; account answer (a) received=%v", g_host.tries, text, g_host.account_ready))
+	// "Invalid User" with no account answer (a) after the full HOST_ACCOUNT_WAIT:
+	// Krunker's game server has no account on this connection and treats SR as
+	// a guest, and guests cannot create games. Trying again on the same
+	// connection does not change that (seen live 2026-11-19: four tries).
+	if text == "Invalid User" && !g_host.account_ready {
+		kproto.network_log("host", "ERROR Krunker never logged the account in on the lobby connection (no a packet), so it refused to create the game")
+		host_game_fail(client, HOST_NOT_LOGGED_IN)
+		return
+	}
 	if text == "Invalid User" && g_host.tries < HOST_TRIES {
 		g_host.phase, g_host.since = .WAITING, time.now()
 		krunker_ws_set_status(client, fmt.tprintf("Creating your custom game (Krunker is still loading your account, try %d of %d)...", g_host.tries + 1, HOST_TRIES))
@@ -327,13 +381,16 @@ host_game_tick :: proc(client: ^Client) {
 		kproto.krunker_world_reset(&client.krunker_world)
 		net_client_disconnect(&client.net)
 		g_host.phase, g_host.since = .SEEKING, time.now()
-		g_host.account_ready = false
+		g_host.account_ready, g_host.recv_logged = false, 0
 		if !krunker_ws_connect(client, &client.join_link) && g_host.phase == .SEEKING { g_host.phase = .NONE }
 	case .SEEKING:
 		// Waiting for the lobby (or for the verification window).
 		if !client.krunker.connected && client.access.status != .PENDING && client.join_queued == 0 { g_host.phase = .NONE }
 	case .WAITING:
 		if !client.krunker.connected { host_game_fail(client, HOST_LOST_CONNECTION); return }
+		// No account 2 s after ready: log the connection in as the page does
+		// after a fresh login (_0 login), once.
+		if !g_host.account_ready && time.since(g_host.since) > 2*time.Second { krunker_ws_send_account_login(client) }
 		if !g_host.account_ready && g_host.tries == 0 && time.since(g_host.since) < HOST_ACCOUNT_WAIT { return }
 		if time.since(g_host.since) < (g_host.tries == 0 ? (g_host.account_ready ? 300*time.Millisecond : 0) : HOST_RETRY_DELAY) { return }
 		if !host_send_custom(&client.krunker, &client.menu.host) { host_game_fail(client, "Could not send the host setup to Krunker."); return }

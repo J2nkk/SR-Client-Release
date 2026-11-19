@@ -24,6 +24,11 @@ Client_Access :: struct {
 	join_after_access: bool,
 	started: time.Time,
 	child: access.Child,
+	// Native FRVR session (frvr_auth.odin): the refresh token the browser
+	// login handed over with its access token, and the email-code login flow.
+	pending_refresh: string,
+	login_email, login_flow: string,
+	session_checked, has_session: bool,
 }
 
 client_access_log :: proc(state: ^Client_Access, text: string) {
@@ -44,6 +49,7 @@ client_access_cancel :: proc(client: ^Client) {
 	client.access.join_after_access = false
 	client.access.captcha_pending = false
 	delete(client.access.captcha_token); client.access.captcha_token = ""
+	delete(client.access.pending_refresh); client.access.pending_refresh = ""
 	when ODIN_OS == .Windows { access.stop(&client.access.child, client.access.request-1) }
 }
 
@@ -115,7 +121,19 @@ client_access_assignment_url :: proc(value: string) -> (string, string, bool) {
 }
 client_browser_captcha_start :: proc(client: ^Client) -> bool {
 	when ODIN_OS == .Windows {
-		return access.start(&client.access.child, client.access.request, false, "CAPTCHA", client.join_link.game_id)
+		// The verification page gets SR's own session before its scripts run:
+		// logged in, with an access token far from expiry, so its SDK never
+		// renews (rotates) the refresh token SR holds.
+		request := client.join_link.game_id
+		if session_access, session_refresh, ok := access.session_load(); ok {
+			defer { delete(session_access); delete(session_refresh) }
+			Captcha_Request :: struct { game, access, refresh: string }
+			if data, err := json.marshal(Captcha_Request{client.join_link.game_id, session_access, session_refresh}, allocator = context.temp_allocator); err == nil {
+				request = string(data)
+				client_access_log(&client.access, "Verification window gets SR's FRVR session before the page loads; it will not renew it.")
+			}
+		}
+		return access.start(&client.access.child, client.access.request, false, "CAPTCHA", request)
 	} else { return false }
 }
 client_captcha_begin :: proc(client: ^Client, start_browser: proc(^Client) -> bool = client_browser_captcha_start) -> bool {
@@ -123,12 +141,18 @@ client_captcha_begin :: proc(client: ^Client, start_browser: proc(^Client) -> bo
 	if state.status == .PENDING { return true }
 	game := client.join_link.game_id
 	if state.captcha_retried || !(host_game_seeking() && len(game) == 0 || access.captcha_game_valid(game)) { return false }
+	when ODIN_OS == .Windows {
+		// At least 10 minutes left, so the page has no reason to renew it.
+		if expiry := access.token_expiry(state.token); expiry > 0 && expiry - time.time_to_unix(time.now()) < 600 {
+			client_access_renew(client, time.time_to_unix(time.now()), force = true)
+		}
+	}
 	state.captcha_retried, state.captcha_pending = true, true
 	state.request += 1
 	state.log_request, state.join_after_access = state.request, true
 	state.status, state.started = .PENDING, time.now()
 	client_access_log(state, "Native matchmaking requires verification; opening the official page for this invite. The assigned game socket will be handed to the native client before opening.")
-	krunker_ws_set_status(client, "Preparing verification handoff...")
+	krunker_ws_set_status(client, "Krunker is verifying this connection (usually a few seconds)...")
 	if !start_browser(client) {
 		client_access_cancel(client); state.status = .ERROR
 		krunker_ws_set_status(client, "Could not start the challenge helper. Rebuild the Windows browser helper and retry Join.")
@@ -195,7 +219,7 @@ client_browser_invalidate :: proc() {
 }
 client_browser_save :: proc(token: string) -> bool { when ODIN_OS == .Windows { return access.cache_save(token) } else { return false } }
 
-client_access_retry :: proc(client: ^Client, rejected: bool, start_browser: proc(^Client_Access) -> bool = client_browser_start, invalidate: proc() = client_browser_invalidate) -> bool {
+client_access_retry :: proc(client: ^Client, rejected: bool, start_browser: proc(^Client_Access) -> bool = client_browser_start, invalidate: proc() = client_browser_invalidate, renew: proc(^Client) -> bool = client_access_renew_forced, connect: proc(^Client, ^shared.Join_Link) -> bool = krunker_ws_connect_ready) -> bool {
 	if !rejected { return false }
 	client_access_log(&client.access, "Server explicitly rejected access; invalidating the token and encrypted cache.")
 	delete(client.access.token); client.access.token = ""
@@ -205,8 +229,18 @@ client_access_retry :: proc(client: ^Client, rejected: bool, start_browser: proc
 		client.access.status = .ERROR; return false
 	}
 	client.access.retried = true
-	client_access_log(&client.access, "Requesting browser access for the single permitted authentication retry.")
-	return client_access_begin(client, start_browser)
+	when ODIN_OS == .Windows {
+		if renew(client) {
+			client_access_log(&client.access, "Renewed access through FRVR's API; retrying once with the new token.")
+			connect(client, &client.join_link)
+			return true
+		}
+		client_access_need_login(client)
+		return true
+	} else {
+		client_access_log(&client.access, "Requesting browser access for the single permitted authentication retry.")
+		return client_access_begin(client, start_browser)
+	}
 }
 
 client_access_tick :: proc(client: ^Client, poll_browser: proc(^Client_Access) -> (access.Message, bool, bool) = client_browser_poll, connect: proc(^Client, ^shared.Join_Link) -> bool = krunker_ws_connect_ready, persist: proc(string) -> bool = client_browser_save) {
@@ -281,19 +315,34 @@ client_access_tick :: proc(client: ^Client, poll_browser: proc(^Client_Access) -
 			client_access_log(state, "Challenge proof received over private pipe; helper closing. Retrying native matchmaking once; proof omitted.")
 			krunker_ws_set_status(client, "Verification received; retrying native matchmaking...")
 			connect(client, &client.join_link)
+		case "LOGIN_REQUEST":
+			// How Krunker's page logged in (address and field names, no values),
+			// for adding the same login to SR's Account window.
+			if len(message.value) > 0 && len(message.value) <= 600 { kproto.network_log("login-shape", message.value) }
+		case "SESSION_REFRESH":
+			// Sent just before TOKEN by a browser login: the page's refresh token,
+			// so SR renews the session itself from now on.
+			if state.captcha_pending || len(message.value) == 0 || len(message.value) > 32768 { return }
+			kproto.network_log_secret(message.value); kproto.network_log_secret(access.token_unquote(message.value))
+			delete(state.pending_refresh); state.pending_refresh = strings.clone(access.token_unquote(message.value))
 		case "TOKEN":
 			if state.captcha_pending {
 				client_access_cancel(client); state.status = .ERROR
 				krunker_ws_set_status(client, access.status_text("CAPTCHA_SETUP_FAILED")); return
 			}
-			token_state := access.token_state(message.value, time.time_to_unix(time.now()))
+			token_state := access.token_state(access.token_unquote(message.value), time.time_to_unix(time.now()))
 			if token_state != .READY {
 				client_access_log(state, token_state == .GUEST ? access.diagnostic_text("GUEST_TOKEN") : "Helper token rejected by native expiry check; token contents omitted.")
 				client_access_cancel(client); state.status = .ERROR
 				krunker_ws_set_status(client, access.status_text(token_state == .GUEST ? "GUEST_TOKEN" : "BAD_TOKEN")); return
 			}
-			delete(state.token); state.token = strings.clone(message.value)
+			delete(state.token); state.token = strings.clone(access.token_unquote(message.value))
 			client_access_log(state, "Browser access passed native expiry and guest-platform checks; token contents omitted.")
+			when ODIN_OS == .Windows {
+				if len(state.pending_refresh) > 0 && client_session_store(client, state.token, state.pending_refresh) {
+					client_access_log(state, "Browser login handed over its FRVR session; SR renews it through FRVR's API from now on.")
+				}
+			}
 			state.from_browser = true
 			join_after_access := state.join_after_access
 			client_access_cancel(client)
@@ -335,6 +384,8 @@ client_access_forget :: proc(client: ^Client) {
 	delete(client.access.token); client.access.token = ""
 	delete(client.access.assignment_url); client.access.assignment_url = ""
 	client.access.from_browser, client.access.retried = false, false
+	client.access.session_checked, client.access.has_session = true, false
+	delete(client.access.login_flow); client.access.login_flow = ""
 	when ODIN_OS == .Windows {
 		if !access.forget() {
 			client_access_log(&client.access, "Browser session could not be cleared; close other SR Client browser windows and retry.")

@@ -176,7 +176,7 @@ hud_render :: proc(client: ^Client, delta: f32, pointer_blocked := false) {
 	}
 	client.binding_event = 0
 	if pointer_blocked { debug_ui_block_menu_input(&input) }
-	if (client.menu.number_edit != .NONE || client.menu.color_edit != 0 || client.menu.import_open || menuui.settings_search_focused(&client.menu) || menuui.host_typing(&client.menu)) && input.paste && !client.menu.previous.paste { input.text = glfw.GetClipboardString(client.window) }
+	if (client.menu.number_edit != .NONE || client.menu.color_edit != 0 || client.menu.import_open || menuui.settings_search_focused(&client.menu) || menuui.host_typing(&client.menu) || menuui.login_typing(&client.menu)) && input.paste && !client.menu.previous.paste { input.text = glfw.GetClipboardString(client.window) }
 	client.menu_scroll = {}
 	client.menu_text_length = 0
 	phase_mark(.MENU_VIEW)

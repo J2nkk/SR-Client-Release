@@ -325,13 +325,32 @@ when ODIN_TEST {
 	browser_authentication_retries_only_once :: proc(t: ^testing.T) {
 		client: Client; defer access_test_cleanup(&client)
 		client.access.token = access_test_token()
-		testing.expect(t, !client_access_retry(&client, false, access_test_start, access_test_invalidate))
-		testing.expect(t, client_access_retry(&client, true, access_test_start, access_test_invalidate))
-		client_access_tick(&client, access_test_poll, access_test_connect, access_test_persist)
-		testing.expect(t, client.net_input_seq == 1 && client.access.retried)
-		testing.expect(t, !client_access_retry(&client, true, access_test_start, access_test_invalidate))
-		testing.expect(t, len(client.access.token) == 0 && client.access.status == .ERROR)
+		when ODIN_OS == .Windows {
+			// Windows renews through FRVR's API (no browser) and reconnects once.
+			testing.expect(t, !client_access_retry(&client, false, access_test_start, access_test_invalidate, access_test_renew_ok, access_test_connect))
+			testing.expect(t, client_access_retry(&client, true, access_test_start, access_test_invalidate, access_test_renew_ok, access_test_connect))
+			testing.expect(t, client.net_input_seq == 1 && client.access.retried, "a renewed token reconnects once")
+			testing.expect(t, !client_access_retry(&client, true, access_test_start, access_test_invalidate, access_test_renew_ok, access_test_connect))
+			testing.expect(t, len(client.access.token) == 0 && client.access.status == .ERROR)
+			// Without a session FRVR accepts, SR asks for a login in the Account window.
+			other: Client; defer access_test_cleanup(&other)
+			other.access.token = access_test_token()
+			testing.expect(t, client_access_retry(&other, true, access_test_start, access_test_invalidate, access_test_renew_fail, access_test_connect))
+			testing.expect(t, other.net_input_seq == 0 && other.menu.page == .ACCOUNT && other.access.status != .PENDING, "no browser: the Account window asks for a login")
+		} else {
+			testing.expect(t, !client_access_retry(&client, false, access_test_start, access_test_invalidate))
+			testing.expect(t, client_access_retry(&client, true, access_test_start, access_test_invalidate))
+			client_access_tick(&client, access_test_poll, access_test_connect, access_test_persist)
+			testing.expect(t, client.net_input_seq == 1 && client.access.retried)
+			testing.expect(t, !client_access_retry(&client, true, access_test_start, access_test_invalidate))
+			testing.expect(t, len(client.access.token) == 0 && client.access.status == .ERROR)
+		}
 	}
+	access_test_renew_ok :: proc(client: ^Client) -> bool {
+		delete(client.access.token); client.access.token, client.access.status = access_test_token(), .READY
+		return true
+	}
+	access_test_renew_fail :: proc(client: ^Client) -> bool { return false }
 	access_test_http :: proc(url, method, body, stage: string) -> ([dynamic]byte, i64, bool) {
 		response := stage == "generate-token" ? "fixture-validation" : stage == "game-list" ? "[]" : `{"error":"INVALID_ACCESS_TOKEN"}`
 		result := make([dynamic]byte); append(&result, response)

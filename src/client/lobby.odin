@@ -270,7 +270,7 @@ menu_view :: proc(client: ^Client) -> menuui.View {
 		spawn_pending = client.spawn_pending, ready = client.krunker.connected ? client.krunker_world.ready && client.krunker.render_map_ready : client.game.ready && (!client.net.connected || client.net.match_state_received),
 		map_name = map_name, mode = mode, lobby_name = online ? (len(client.join_link.game_id) > 0 ? client.join_link.game_id : client.join_link.host) : "Local practice",
 		browser_access_supported = ODIN_OS == .Windows, auth_pending = client.access.status == .PENDING,
-		logged_in = client.access.status == .READY, hosting = host_game_active(),
+		logged_in = client.access.status == .READY || client_access_has_session(client), hosting = host_game_active(),
 		mods_count = len(shared.g_mods.index), mods_problems = shared.g_mods.errors, mods_active = krunker_mod_label(shared.g_mods.active),
 		mods_busy = g_krunker_mods.open || g_krunker_mods.download != nil, mods_supported = ODIN_OS == .Windows,
 		connecting = client.join_queued > 0 || client.access.status == .PENDING && client.access.join_after_access, current_invite = client.join_link.raw, join_status = client.join_status, selection_status = client.selection_status,
@@ -437,6 +437,13 @@ menu_apply_action :: proc(client: ^Client, action: menuui.Action, send_class: pr
 		host_game_start(client)
 	case .LOGIN:
 		when ODIN_OS == .Windows { client_access_login(client) }
+	case .LOGIN_SEND_CODE:
+		client_login_send_code(client)
+	case .LOGIN_CODE:
+		client_login_with_code(client)
+	case .LOGIN_PASSWORD:
+		client_login_with_password(client)
+	case .LOGIN_FIELD: // focusing a login field; typing is handled by the menu
 	case .CANCEL_JOIN:
 		if host_game_active() { host_game_fail(client, "Hosting cancelled."); return }
 		login := client.access.status == .PENDING && !client.access.join_after_access
